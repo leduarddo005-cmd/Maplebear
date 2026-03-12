@@ -1,0 +1,61 @@
+{
+"nodes": [
+{
+"parameters": {
+"method": "POST",
+"url": "https://api.elevenlabs.io/v1/text-to-speech/4svIKGqi17UFblwgh4Rq",
+"sendQuery": true,
+"queryParameters": {
+"parameters": [
+{
+"name": "output_format",
+"value": "opus_48000_128"
+}
+]
+},
+"sendHeaders": true,
+"headerParameters": {
+"parameters": [
+{
+"name": "xi-api-key",
+"value": "sk_5fc9349389cf3a2f325653db658fda42982343cc19dfd4e8"
+}
+]
+},
+"sendBody": true,
+"bodyParameters": {
+"parameters": [
+{
+"name": "text",
+"value": "={{ $('AI Agent1').item.json.output }}"
+},
+{
+"name": "model_id",
+"value": "eleven_turbo_v2_5"
+}
+]
+},
+"options": {}
+},
+"type": "n8n-nodes-base.httpRequest",
+"typeVersion": 4.2,
+"position": [
+4480,
+3392
+],
+"id": "5ce620cf-0030-4a12-989a-e9b2cb3b8422",
+"name": "ElevenLabs | Text-to-Speech"
+}
+],
+"connections": {
+"ElevenLabs | Text-to-Speech": {
+"main": [
+[]
+]
+}
+},
+"pinData": {},
+"meta": {
+"instanceId": "d8e9561de4867d8405cb2418fb34cf8e5a1dd964050e0448b0a77b3e68819c6b"
+}
+}
