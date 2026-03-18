@@ -1,6 +1,15 @@
 import { useState } from "react";
 import imgMapleBear1 from "figma:asset/6c3426f11b33df20ca0ee5541adeebb2cfe1674d.png";
 
+export interface StudentInfo {
+  numero: string;
+  nome: string;
+  anoEstudo: string;
+  escola: string;
+  cidade: string;
+  estado: string;
+}
+
 interface LoginScreenProps {
   onLogin: () => void;
 }

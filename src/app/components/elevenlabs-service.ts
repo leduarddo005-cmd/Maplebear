@@ -2,7 +2,7 @@
 // Configurado com base no workflow n8n do usuario
 
 const ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1/text-to-speech";
-const DEFAULT_API_KEY = "sk_5fc9349389cf3a2f325653db658fda42982343cc19dfd4e8";
+const DEFAULT_API_KEY = "";
 const DEFAULT_VOICE_ID = "xNGAXaCH8MaasNuo7Hr7";
 const MODEL_ID = "eleven_turbo_v2_5";
 // MP3 format — universally supported (iOS Safari does NOT support Opus)
@@ -27,7 +27,7 @@ export function setApiKey(key: string): void {
 }
 
 export function hasApiKey(): boolean {
-  return true; // Sempre true pois temos a key padrao
+  return !!getApiKey();
 }
 
 export function clearApiKey(): void {

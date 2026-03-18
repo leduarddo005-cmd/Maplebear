@@ -6,8 +6,30 @@ import imgDesignSemNome1 from "figma:asset/64af5bea1f7d7b69df13506b3145a332f5049
 import svgPaths from "../../imports/svg-83y6mfkpbk";
 import { speakWithElevenLabs, hasApiKey, unlockAudioForIOS } from "./elevenlabs-service";
 import { generateTutorResponse, type ChatMessage } from "./gemini-service";
+import {
+  isDeepgramSupported,
+  startStreaming,
+  type StreamingSession,
+} from "./deepgram-stt-service";
+import { TutorCharacter3D, type CharacterState } from "./TutorCharacter3D";
+import {
+  sendToN8n,
+  playN8nAudio,
+  isWebhookConfigured,
+  type N8nResponse,
+} from "./n8n-service";
 
 type ViewState = "idle" | "recording" | "selectStyle" | "processing" | "response";
+
+// Dados internos do aluno - enviados automaticamente ao webhook
+const STUDENT_INFO = {
+  numero: "21999999999",
+  nome: "Junior",
+  anoEstudo: "7º Ano",
+  escola: "MapleBear Ribeirão Preto Bonfim",
+  cidade: "Ribeirão Preto",
+  estado: "São Paulo",
+};
 
 interface MainScreenProps {
   tutor: string;
@@ -253,17 +275,6 @@ const styleOptions = [
   { id: "pratico", label: "Tutor Prático", icon: Hammer, color: "#27ae60", description: "Exercícios" },
 ];
 
-// ===== Web Speech API types =====
-interface SpeechRecognitionEvent {
-  results: SpeechRecognitionResultList;
-  resultIndex: number;
-}
-
-interface SpeechRecognitionErrorEvent {
-  error: string;
-  message: string;
-}
-
 export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
   const [viewState, setViewState] = useState<ViewState>("idle");
   const [recordingTime, setRecordingTime] = useState(0);
@@ -277,6 +288,8 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
   const [useTextInput, setUseTextInput] = useState(false);
   const [textInput, setTextInput] = useState("");
   const [micAvailable, setMicAvailable] = useState<boolean | null>(null);
+  const [transcribeError, setTranscribeError] = useState("");
+  const [micVolume, setMicVolume] = useState(0);
   // ===== CONVERSATION STATE =====
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [currentStyle, setCurrentStyle] = useState<string>("");
@@ -284,12 +297,13 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
   const [isFollowUpProcessing, setIsFollowUpProcessing] = useState(false);
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const recognitionRef = useRef<any>(null);
+  const streamRef = useRef<StreamingSession | null>(null);
   const audioAbortRef = useRef<(() => void) | null>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const textInputRef = useRef<HTMLInputElement>(null);
   const followUpInputRef = useRef<HTMLInputElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  const ttsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const title = tutorNames[tutor] || "MAPLE BEAR\nINGLES";
 
@@ -297,7 +311,11 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
   useEffect(() => {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
-      stopRecognition();
+      if (ttsIntervalRef.current) clearInterval(ttsIntervalRef.current);
+      if (streamRef.current) {
+        streamRef.current.cancel();
+        streamRef.current = null;
+      }
       stopAudio();
       window.speechSynthesis.cancel();
     };
@@ -313,14 +331,12 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
   }, [chatHistory, viewState]);
 
   // ===== DETECT MIC & ENVIRONMENT =====
-  const useTextInputRef = useRef(false);
-  useEffect(() => { useTextInputRef.current = useTextInput; }, [useTextInput]);
 
   const [isWebView, setIsWebView] = useState(false);
 
   useEffect(() => {
     const ua = navigator.userAgent || "";
-    // Detect in-app browsers (WebView) that don't support SpeechRecognition
+    // Detect in-app browsers (WebView)
     const wvPatterns = [
       /FBAN|FBAV/i, /Instagram/i, /Line\//i, /Twitter/i,
       /MicroMessenger/i, /; wv\)/i, /GSA\//i, /DuckDuckGo/i,
@@ -328,16 +344,21 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
     ];
     setIsWebView(wvPatterns.some((p) => p.test(ua)));
 
-    const W = window as any;
-    const SR = W.SpeechRecognition || W.webkitSpeechRecognition;
-    if (!SR) { setMicAvailable(false); return; }
+    // Deepgram uses AudioContext + WebSocket — check if available
+    if (isDeepgramSupported()) {
+      setMicAvailable(true);
+    } else {
+      setMicAvailable(false);
+    }
 
+    // Also check permission status
     (async () => {
       try {
         const perm = await navigator.permissions.query({ name: "microphone" as PermissionName });
-        if (perm.state === "denied") { setMicAvailable(false); return; }
-      } catch (_e) { /* ok */ }
-      setMicAvailable(true);
+        if (perm.state === "denied") {
+          setMicAvailable(false);
+        }
+      } catch (_e) { /* permissions API not available — that's fine, we'll try anyway */ }
     })();
   }, []);
 
@@ -355,144 +376,49 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
     }
   }, []);
 
-  // ===== SPEECH RECOGNITION (Web Speech API) =====
-  const getSpeechRecognition = (): any | null => {
-    const W = window as any;
-    const SR = W.SpeechRecognition || W.webkitSpeechRecognition;
-    if (!SR) return null;
-    return new SR();
-  };
-
+  // ===== DEEPGRAM REAL-TIME STREAMING STT =====
+  // Architecture: Mic → AudioContext → PCM → WebSocket → live transcript
   const [micHint, setMicHint] = useState("");
-  const noResultTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const startRecognition = () => {
-    const recognition = getSpeechRecognition();
-    if (!recognition) {
-      setMicStatus("error");
-      setMicHint("Reconhecimento de voz não suportado neste navegador. Use o Chrome.");
-      setUseTextInput(true);
-      return;
-    }
-
-    recognition.lang = "pt-BR";
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
-
-    let gotResult = false;
-
-    // Rebuild full transcript from ALL results every time (index 0).
-    // This avoids the duplication bug where a closure variable accumulates
-    // AND the browser keeps old results in event.results.
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      gotResult = true;
-      setMicHint("");
-      if (noResultTimeoutRef.current) {
-        clearTimeout(noResultTimeoutRef.current);
-        noResultTimeoutRef.current = null;
-      }
-      let finalPart = "";
-      let interimPart = "";
-      for (let i = 0; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) {
-          finalPart += result[0].transcript + " ";
-        } else {
-          interimPart += result[0].transcript;
-        }
-      }
-      setTranscription((finalPart + interimPart).trim());
-    };
-
-    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      console.warn("[STT] Error:", event.error, event.message);
-      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-        setMicStatus("error");
-        setMicHint("Permissão do microfone negada. Permita o acesso nas configurações do navegador.");
-        setUseTextInput(true);
-        setMicAvailable(false);
-        if (timerRef.current) clearInterval(timerRef.current);
-      } else if (event.error === "audio-capture") {
-        setMicStatus("error");
-        setMicHint("Nenhum microfone detectado. Conecte um microfone e tente novamente.");
-        setUseTextInput(true);
-        if (timerRef.current) clearInterval(timerRef.current);
-      } else if (event.error === "network") {
-        setMicStatus("error");
-        setMicHint("Sem conexão com o serviço de voz. Verifique sua internet ou use o campo de texto.");
-        setUseTextInput(true);
-        if (timerRef.current) clearInterval(timerRef.current);
-      } else if (event.error === "no-speech") {
-        setMicHint("Nenhuma fala detectada. Fale mais perto do microfone.");
-      } else if (event.error === "aborted") {
-        // Intentional abort — ignore
-      }
-    };
-
-    recognition.onend = () => {
-      // If still recording and not switched to text mode, restart
-      if (recognitionRef.current === recognition && !useTextInputRef.current) {
-        try {
-          recognition.start();
-        } catch (_e) {
-          // ignore
-        }
-      }
-    };
-
-    recognition.onaudiostart = () => {
-      setMicStatus("listening");
-      setMicHint("");
-    };
-
-    try {
-      recognition.start();
-      recognitionRef.current = recognition;
-      setMicStatus("listening");
-
-      // Timeout: if no result in 8s, show a hint
-      noResultTimeoutRef.current = setTimeout(() => {
-        if (!gotResult && recognitionRef.current === recognition) {
-          setMicHint("Não estou ouvindo nada. Verifique se o microfone está ligado e fale mais alto.");
-        }
-      }, 8000);
-    } catch (err) {
-      console.error("[STT] Failed to start:", err);
-      setMicStatus("error");
-      setMicHint("Não foi possível iniciar o microfone. Tente usar o campo de texto.");
-      setUseTextInput(true);
+  // Cancel any active streaming session
+  const cancelActiveSession = () => {
+    if (streamRef.current) {
+      streamRef.current.cancel();
+      streamRef.current = null;
     }
   };
 
-  const stopRecognition = () => {
-    if (noResultTimeoutRef.current) {
-      clearTimeout(noResultTimeoutRef.current);
-      noResultTimeoutRef.current = null;
-    }
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (_e) {
-        // ignore
-      }
-      recognitionRef.current = null;
-    }
-    setMicHint("");
-    setMicStatus("idle");
-  };
+  // Start real-time streaming transcription
+  const beginStreaming = async () => {
+    // Ensure TTS is fully stopped
+    if (ttsIntervalRef.current) { clearInterval(ttsIntervalRef.current); ttsIntervalRef.current = null; }
+    window.speechSynthesis.cancel();
+    cancelActiveSession();
 
-  const simulateTranscription = () => {
-    const phrases = [
-      "Ola, ",
-      "Ola, como ",
-      "Ola, como funciona ",
-      "Ola, como funciona a ",
-      "Ola, como funciona a sequencia ",
-      "Ola, como funciona a sequencia de ",
-      "Ola, como funciona a sequencia de Fibonacci?",
-    ];
-    phrases.forEach((p, i) => setTimeout(() => setTranscription(p), (i + 1) * 800));
+    const session = await startStreaming({
+      onTranscript: (text, _isFinal) => {
+        // Update transcription progressively as user speaks
+        setTranscription(text);
+      },
+      onStarted: () => {
+        setMicStatus("listening");
+        setMicHint("");
+        console.log("[Voice] Streaming started — listening");
+      },
+      onError: (msg) => {
+        console.error("[Voice] Streaming error:", msg);
+        setMicStatus("error");
+        setMicHint(msg);
+        setMicVolume(0);
+        if (timerRef.current) clearInterval(timerRef.current);
+        setUseTextInput(true);
+      },
+      onVolume: (level) => setMicVolume(level),
+    });
+
+    if (session) {
+      streamRef.current = session;
+    }
   };
 
   // ===== AUDIO PLAYBACK =====
@@ -505,6 +431,8 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
       currentAudioRef.current.pause();
       currentAudioRef.current = null;
     }
+    // Clean up TTS interval BEFORE cancelling speech (prevents leaks)
+    if (ttsIntervalRef.current) { clearInterval(ttsIntervalRef.current); ttsIntervalRef.current = null; }
     window.speechSynthesis.cancel();
     setIsSpeaking(false);
   };
@@ -537,6 +465,8 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
 
   const browserTTS = (text: string) => {
     window.speechSynthesis.cancel();
+    // Clear any previous TTS interval
+    if (ttsIntervalRef.current) { clearInterval(ttsIntervalRef.current); ttsIntervalRef.current = null; }
     const u = new SpeechSynthesisUtterance(text);
     u.lang = "pt-BR";
     u.rate = 0.95;
@@ -544,20 +474,18 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
     const voices = window.speechSynthesis.getVoices();
     const pv = voices.find((v) => v.lang.startsWith("pt") && v.name.includes("Google")) || voices.find((v) => v.lang.startsWith("pt"));
     if (pv) u.voice = pv;
-    u.onstart = () => setIsSpeaking(true);
-    u.onend = () => setIsSpeaking(false);
-    u.onerror = () => setIsSpeaking(false);
     window.speechSynthesis.speak(u);
     // iOS Safari bug: speechSynthesis pauses after ~15s. Periodic resume fixes it.
-    const iosResumeInterval = setInterval(() => {
+    ttsIntervalRef.current = setInterval(() => {
       if (!window.speechSynthesis.speaking) {
-        clearInterval(iosResumeInterval);
+        if (ttsIntervalRef.current) { clearInterval(ttsIntervalRef.current); ttsIntervalRef.current = null; }
       } else {
         window.speechSynthesis.resume();
       }
     }, 5000);
-    u.onend = () => { clearInterval(iosResumeInterval); setIsSpeaking(false); };
-    u.onerror = () => { clearInterval(iosResumeInterval); setIsSpeaking(false); };
+    u.onstart = () => setIsSpeaking(true);
+    u.onend = () => { if (ttsIntervalRef.current) { clearInterval(ttsIntervalRef.current); ttsIntervalRef.current = null; } setIsSpeaking(false); };
+    u.onerror = () => { if (ttsIntervalRef.current) { clearInterval(ttsIntervalRef.current); ttsIntervalRef.current = null; } setIsSpeaking(false); };
   };
 
   const toggleSpeech = () => {
@@ -596,20 +524,19 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
     setTranscription("");
   };
 
-  // ===== RECORDING FLOW =====
+  // ===== RECORDING FLOW (Deepgram REST) =====
+  // Flow: press mic → record → press stop → "Transcrevendo..." → Deepgram POST → text appears
   const startRecording = () => {
     unlockAudioForIOS();
+    stopAudio();
     setMicHint("");
+    setTranscribeError("");
 
-    // Check if SpeechRecognition API exists at all
-    const W = window as any;
-    const SR = W.SpeechRecognition || W.webkitSpeechRecognition;
-    if (!SR) {
-      // API not available — redirect to text input with helpful message
+    if (!isDeepgramSupported()) {
       if (isWebView) {
-        setMicHint("O navegador interno não suporta voz. Abra no Chrome.");
+        setMicHint("O navegador interno nao suporta voz. Abra em um navegador como Chrome ou Safari.");
       } else {
-        setMicHint("Navegador sem suporte a voz. Use Chrome no desktop ou Android.");
+        setMicHint("Navegador sem suporte a voz. Use o campo de texto.");
       }
       setViewState("recording");
       setUseTextInput(true);
@@ -621,41 +548,65 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
     setRecordingTime(0);
     setTranscription("");
     setTtsError("");
+    setUseTextInput(false);
     timerRef.current = setInterval(() => setRecordingTime((t) => t + 1), 1000);
-    startRecognition();
+    beginStreaming();
   };
 
   const cancelRecording = () => {
     if (timerRef.current) clearInterval(timerRef.current);
-    stopRecognition();
+    cancelActiveSession();
     stopAudio();
     setViewState("idle");
     setRecordingTime(0);
     setTranscription("");
+    setMicHint("");
+    setMicStatus("idle");
+    setMicVolume(0);
   };
 
   const sendRecording = () => {
+    // Grab the live transcript accumulated so far
+    const savedText = (streamRef.current?.getTranscript() || transcription).trim();
+
+    // Stop timer + streaming session
     if (timerRef.current) clearInterval(timerRef.current);
-    stopRecognition();
-    if (!transcription.trim()) {
-      // Nothing was said, go back
+    cancelActiveSession();
+    setMicStatus("idle");
+    setMicVolume(0);
+
+    if (!savedText) {
+      setMicHint("Nenhuma fala detectada. Fale algo e tente novamente.");
       setViewState("idle");
       return;
     }
-    // If we already have a style from a previous conversation, skip style selection
+
+    setTranscription(savedText);
+
+    // Next step: style selection or direct processing
     if (currentStyle) {
-      handleSelectStyle(currentStyle);
+      handleSelectStyle(currentStyle, savedText);
     } else {
       setViewState("selectStyle");
     }
   };
 
   const handleSelectStyle = useCallback(async (styleId: string, question?: string) => {
-    unlockAudioForIOS(); // Last user gesture before async — unlock iOS audio
+    unlockAudioForIOS();
     setSelectedStyle(styleId);
     setCurrentStyle(styleId);
     setViewState("processing");
-    const q = question || transcription;
+    const q = (question || transcription || "").trim();
+
+    if (!q) {
+      // Safety: if somehow we got here with no question, show fallback
+      console.warn("[handleSelectStyle] No question text — using generic greeting");
+      const resp = generateContextualFallback("oi", tutor, styleId);
+      setResponse(resp);
+      setViewState("response");
+      speakResponse(resp);
+      return;
+    }
 
     const msgs = [
       "Hum... Entendi, deixe-me pensar...",
@@ -665,31 +616,90 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
     ];
     msgs.forEach((msg, i) => setTimeout(() => setProcessingText(msg), i * 1200));
 
-    // Add user message to chat history
     const newUserMsg: ChatMessage = { role: "user", text: q };
     const updatedHistory = [...chatHistory, newUserMsg];
     setChatHistory(updatedHistory);
 
-    try {
-      const geminiResponse = await generateTutorResponse({
-        question: q,
-        tutorKey: tutor,
-        styleId,
-        conversationHistory: chatHistory, // pass previous history (without current msg, it's in `question`)
-      });
-      const newTutorMsg: ChatMessage = { role: "tutor", text: geminiResponse };
-      setChatHistory([...updatedHistory, newTutorMsg]);
-      setResponse(geminiResponse);
-      setViewState("response");
-      speakResponse(geminiResponse);
-    } catch (err: any) {
-      console.error("Gemini error, using fallback:", err);
-      const resp = generateContextualFallback(q, tutor, styleId);
+    // Helper to show response and speak it
+    const showResponse = (resp: string, audioUrl?: string) => {
       const newTutorMsg: ChatMessage = { role: "tutor", text: resp };
       setChatHistory([...updatedHistory, newTutorMsg]);
       setResponse(resp);
       setViewState("response");
-      speakResponse(resp);
+
+      // Se o n8n já retornou áudio pré-gerado, usa ele
+      if (audioUrl) {
+        const result = playN8nAudio(
+          audioUrl,
+          () => setIsSpeaking(true),
+          () => setIsSpeaking(false),
+          (err) => {
+            console.warn("[n8n] Pre-generated audio failed, falling back to TTS:", err);
+            try { speakResponse(resp); } catch (_e) { /* TTS optional */ }
+          }
+        );
+        if (result) {
+          audioAbortRef.current = result.abort;
+          currentAudioRef.current = result.audio;
+          return;
+        }
+      }
+
+      // Fallback: TTS local (ElevenLabs ou browser)
+      try { speakResponse(resp); } catch (_e) { /* TTS optional */ }
+    };
+
+    // ===== ESTRATÉGIA: n8n primeiro → Gemini local → fallback =====
+    try {
+      if (isWebhookConfigured()) {
+        // 1️⃣ n8n webhook (caminho principal)
+        console.log("[AI] Trying n8n webhook...");
+        const n8nResult: N8nResponse = await sendToN8n({
+          message: q,
+          tutorKey: tutor,
+          styleId,
+          conversationHistory: chatHistory,
+          studentName: STUDENT_INFO.nome,
+          studentInfo: STUDENT_INFO,
+        });
+        showResponse(n8nResult.text, n8nResult.audioUrl);
+      } else {
+        // 2️⃣ Gemini direto (webhook não configurado)
+        console.log("[AI] No n8n webhook configured, using Gemini directly...");
+        const geminiResponse = await generateTutorResponse({
+          question: q,
+          tutorKey: tutor,
+          styleId,
+          conversationHistory: chatHistory,
+        });
+        showResponse(geminiResponse);
+      }
+    } catch (err: any) {
+      console.error("[AI] Primary path failed:", err.message);
+
+      // 3️⃣ Se n8n falhou, tenta Gemini como fallback
+      if (isWebhookConfigured()) {
+        try {
+          console.log("[AI] n8n failed, falling back to Gemini...");
+          const geminiResponse = await generateTutorResponse({
+            question: q,
+            tutorKey: tutor,
+            styleId,
+            conversationHistory: chatHistory,
+          });
+          showResponse(geminiResponse);
+          return;
+        } catch (geminiErr: any) {
+          console.error("[AI] Gemini fallback also failed:", geminiErr.message);
+        }
+      }
+
+      // 4️⃣ Fallback local (respostas pré-definidas)
+      try {
+        showResponse(generateContextualFallback(q, tutor, styleId));
+      } catch (_e2) {
+        showResponse(`Desculpe, tive um problema para processar sua pergunta. Tente novamente!`);
+      }
     }
   }, [tutor, speakResponse, transcription, chatHistory]);
 
@@ -708,24 +718,75 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
     // Scroll to bottom
     setTimeout(() => chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: "smooth" }), 100);
 
-    try {
-      const geminiResponse = await generateTutorResponse({
-        question: q,
-        tutorKey: tutor,
-        styleId: currentStyle,
-        conversationHistory: chatHistory,
-      });
-      const newTutorMsg: ChatMessage = { role: "tutor", text: geminiResponse };
-      setChatHistory([...updatedHistory, newTutorMsg]);
-      setResponse(geminiResponse);
-      speakResponse(geminiResponse);
-    } catch (err) {
-      console.error("Gemini follow-up error:", err);
-      const resp = generateContextualFallback(q, tutor, currentStyle);
+    // Helper: mostra resposta do follow-up e fala
+    const showFollowUp = (resp: string, audioUrl?: string) => {
       const newTutorMsg: ChatMessage = { role: "tutor", text: resp };
       setChatHistory([...updatedHistory, newTutorMsg]);
       setResponse(resp);
-      speakResponse(resp);
+
+      if (audioUrl) {
+        const result = playN8nAudio(
+          audioUrl,
+          () => setIsSpeaking(true),
+          () => setIsSpeaking(false),
+          () => { try { speakResponse(resp); } catch (_e) { /* ok */ } }
+        );
+        if (result) {
+          audioAbortRef.current = result.abort;
+          currentAudioRef.current = result.audio;
+          return;
+        }
+      }
+      try { speakResponse(resp); } catch (_e) { /* ok */ }
+    };
+
+    try {
+      if (isWebhookConfigured()) {
+        // n8n primeiro
+        const n8nResult = await sendToN8n({
+          message: q,
+          tutorKey: tutor,
+          styleId: currentStyle,
+          conversationHistory: chatHistory,
+          studentName: STUDENT_INFO.nome,
+          studentInfo: STUDENT_INFO,
+        });
+        showFollowUp(n8nResult.text, n8nResult.audioUrl);
+      } else {
+        // Gemini direto
+        const geminiResponse = await generateTutorResponse({
+          question: q,
+          tutorKey: tutor,
+          styleId: currentStyle,
+          conversationHistory: chatHistory,
+        });
+        showFollowUp(geminiResponse);
+      }
+    } catch (err: any) {
+      console.error("[AI] Follow-up primary failed:", err.message);
+
+      // Fallback: Gemini se n8n falhou
+      if (isWebhookConfigured()) {
+        try {
+          const geminiResponse = await generateTutorResponse({
+            question: q,
+            tutorKey: tutor,
+            styleId: currentStyle,
+            conversationHistory: chatHistory,
+          });
+          showFollowUp(geminiResponse);
+          return;
+        } catch (_geminiErr) { /* continue to local fallback */ }
+      }
+
+      // Fallback local
+      try {
+        showFollowUp(generateContextualFallback(q, tutor, currentStyle));
+      } catch (_e2) {
+        const fallback = "Desculpe, tive um problema. Tente novamente!";
+        setChatHistory([...updatedHistory, { role: "tutor", text: fallback }]);
+        setResponse(fallback);
+      }
     } finally {
       setIsFollowUpProcessing(false);
       setTimeout(() => {
@@ -735,10 +796,78 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
     }
   }, [followUpInput, isFollowUpProcessing, chatHistory, tutor, currentStyle, speakResponse]);
 
+  // ===== VOICE FOLLOW-UP (record and transcribe in conversation) =====
+  const [isVoiceFollowUp, setIsVoiceFollowUp] = useState(false);
+  const [voiceFollowUpTime, setVoiceFollowUpTime] = useState(0);
+  const voiceFollowUpTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const startVoiceFollowUp = useCallback(async () => {
+    if (isFollowUpProcessing || isVoiceFollowUp) return;
+    unlockAudioForIOS();
+    stopAudio();
+
+    if (!isDeepgramSupported()) return;
+
+    // Stop TTS
+    if (ttsIntervalRef.current) { clearInterval(ttsIntervalRef.current); ttsIntervalRef.current = null; }
+    window.speechSynthesis.cancel();
+    cancelActiveSession();
+
+    setIsVoiceFollowUp(true);
+    setVoiceFollowUpTime(0);
+    setFollowUpInput("");
+    voiceFollowUpTimerRef.current = setInterval(() => setVoiceFollowUpTime((t) => t + 1), 1000);
+
+    const session = await startStreaming({
+      onTranscript: (text) => {
+        // Live update the follow-up input as user speaks
+        setFollowUpInput(text);
+      },
+      onStarted: () => {
+        console.log("[Voice] Follow-up streaming started");
+      },
+      onError: (msg) => {
+        console.error("[Voice] Follow-up streaming error:", msg);
+        setIsVoiceFollowUp(false);
+        if (voiceFollowUpTimerRef.current) clearInterval(voiceFollowUpTimerRef.current);
+        setMicHint(msg);
+        setMicVolume(0);
+      },
+      onVolume: (level) => setMicVolume(level),
+    });
+
+    if (session) {
+      streamRef.current = session;
+    }
+  }, [isFollowUpProcessing, isVoiceFollowUp]);
+
+  const stopVoiceFollowUp = useCallback(() => {
+    if (voiceFollowUpTimerRef.current) clearInterval(voiceFollowUpTimerRef.current);
+    setIsVoiceFollowUp(false);
+    setMicVolume(0);
+
+    // Grab the live transcript and stop the session
+    const session = streamRef.current;
+    if (session) {
+      const text = session.getTranscript();
+      streamRef.current = null;
+      session.stop().catch(() => {});
+      if (text.trim()) {
+        setFollowUpInput(text.trim());
+      }
+    }
+  }, []);
+
   const formatTime = (s: number) => `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
   const resetToIdle = () => {
     stopAudio();
+    cancelActiveSession();
+    if (isVoiceFollowUp) {
+      if (voiceFollowUpTimerRef.current) clearInterval(voiceFollowUpTimerRef.current);
+      setIsVoiceFollowUp(false);
+    }
+    setMicVolume(0);
     setViewState("idle");
     setResponse("");
     setTranscription("");
@@ -749,7 +878,18 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
     setFollowUpInput("");
     setUseTextInput(false);
     setMicHint("");
+    setTranscribeError("");
   };
+
+  // ===== 3D CHARACTER STATE =====
+  // waiting   → Aguardando o aluno (acenando, convidativo)
+  // listening → Escutando o aluno falar (mic ativo, atento)
+  // talking   → Tutor respondendo (TTS ativo, boca mexendo)
+  const characterState: CharacterState = isSpeaking
+    ? "talking"
+    : viewState === "recording"
+    ? "listening"
+    : "waiting";
 
   /* ======== INTERACTION PANEL ======== */
   const renderPanel = () => (
@@ -762,9 +902,7 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
             <div className="flex flex-col items-center">
               <button
                 onClick={startRecording}
-                className={`w-[clamp(56px,12vmin,100px)] h-[clamp(56px,12vmin,100px)] rounded-full flex items-center justify-center shadow-[3px_3px_8px_rgba(0,0,0,0.6)] border-[clamp(5px,1.5vmin,10px)] active:scale-95 hover:scale-105 transition-transform ${
-                  micAvailable === false ? "bg-[#af0100]/50 border-[#af0100]/50" : "bg-[#af0100] border-[#af0100]"
-                }`}
+                className={`w-[clamp(56px,12vmin,100px)] h-[clamp(56px,12vmin,100px)] rounded-full flex items-center justify-center shadow-[3px_3px_8px_rgba(0,0,0,0.6)] border-[clamp(5px,1.5vmin,10px)] active:scale-95 hover:scale-105 transition-transform bg-[#af0100] border-[#af0100]`}
               >
                 <svg className="w-[clamp(24px,6vmin,48px)] h-[clamp(34px,8vmin,64px)]" viewBox="0 0 45.5 61.75" fill="none">
                   <path d={svgPaths.p9ec0c00} fill="white" />
@@ -790,10 +928,10 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
           </p>
 
           {/* WebView warning */}
-          {isWebView && (
+          {isWebView && !isDeepgramSupported() && (
             <div className="mt-3 mx-4 flex flex-col items-center gap-2 px-4 py-2.5 rounded-[12px] bg-[#e67e22]/10">
               <p className="text-[#e67e22] text-[clamp(10px,1.4vmin,13px)] font-['Inter',sans-serif] text-center leading-[1.4]">
-                Para usar o comando de voz, abra no <strong>Google Chrome</strong>.
+                Para melhor experiencia de voz, abra no <strong>Google Chrome</strong> ou <strong>Safari</strong>.
               </p>
               <button
                 onClick={handleOpenInChrome}
@@ -810,9 +948,16 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
             <div className="mt-3 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#e74c3c]/10">
               <Mic className="w-3.5 h-3.5 text-[#e74c3c]/60" />
               <span className="text-[#e74c3c]/70 text-[clamp(10px,1.3vmin,12px)] font-['Inter',sans-serif]">
-                Voz disponível no Chrome (desktop/Android)
+                Microfone indisponivel neste navegador
               </span>
             </div>
+          )}
+
+          {/* Transcription error feedback */}
+          {transcribeError && (
+            <p className="mt-2 text-[#e74c3c] text-center text-[clamp(10px,1.3vmin,12px)] font-['Inter',sans-serif] px-4">
+              {transcribeError}
+            </p>
           )}
 
           {/* Mic hint feedback */}
@@ -847,15 +992,42 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
             </p>
           )}
 
-          {/* Live transcription */}
+          {/* Live transcription + volume visualization */}
           <div className="min-h-[50px] sm:min-h-[60px] flex items-center justify-center mb-4 sm:mb-5">
-            <p className="text-[#1e1e1e] text-center text-[clamp(15px,2.5vmin,26px)] leading-[1.3]" style={{ fontFamily: "'Luckiest Guy', cursive" }}>
-              {transcription || (
-                <span className="text-[#919191]">
-                  {micStatus === "listening" ? "Ouvindo..." : "Fale algo..."}
-                </span>
+            <div className="flex flex-col items-center gap-2 w-full">
+              {/* Volume bars */}
+              {micStatus === "listening" && (
+                <div className="flex items-end gap-[3px] h-[28px]">
+                  {[0.08, 0.15, 0.22, 0.3, 0.2, 0.35, 0.25, 0.18, 0.28, 0.12, 0.32, 0.15].map((threshold, i) => {
+                    const active = micVolume > threshold;
+                    const h = 8 + (i % 3 === 0 ? 16 : i % 2 === 0 ? 12 : 20);
+                    return (
+                      <div
+                        key={i}
+                        className="w-[4px] rounded-full transition-all duration-100"
+                        style={{
+                          height: active ? `${Math.min(h * (0.5 + micVolume * 3), 28)}px` : "4px",
+                          backgroundColor: active ? "#27ae60" : "#ccc",
+                        }}
+                      />
+                    );
+                  })}
+                </div>
               )}
-            </p>
+              {/* Transcription text or status */}
+              <p className="text-[#1e1e1e] text-center text-[clamp(15px,2.5vmin,26px)] leading-[1.3] px-2" style={{ fontFamily: "'Luckiest Guy', cursive" }}>
+                {transcription || (
+                  <span className="text-[#919191]">
+                    {micStatus === "listening" ? "Ouvindo..." : "Preparando microfone..."}
+                  </span>
+                )}
+              </p>
+              {micStatus === "listening" && !transcription && (
+                <p className="text-[#b3b3b3] text-center text-[clamp(10px,1.3vmin,12px)] font-['Inter',sans-serif]">
+                  Fale sua pergunta e aperte ENVIAR
+                </p>
+              )}
+            </div>
           </div>
 
           {/* Cancel & Send */}
@@ -875,7 +1047,15 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
           </div>
           {/* Switch to text input */}
           <button
-            onClick={() => { stopRecognition(); if (timerRef.current) clearInterval(timerRef.current); setUseTextInput(true); setTextInput(transcription); setTimeout(() => textInputRef.current?.focus(), 100); }}
+            onClick={() => {
+              cancelActiveSession();
+              if (timerRef.current) clearInterval(timerRef.current);
+              setMicVolume(0);
+              setMicStatus("idle");
+              setUseTextInput(true);
+              setTextInput(transcription);
+              setTimeout(() => textInputRef.current?.focus(), 100);
+            }}
             className="mt-3 flex items-center justify-center gap-1.5 w-full"
           >
             <Keyboard className="w-3.5 h-3.5 text-[#2980b9]" />
@@ -997,6 +1177,8 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
         </div>
       )}
 
+
+
       {viewState === "processing" && (
         <div className="px-4 sm:px-6 lg:px-8 py-6 sm:py-8 lg:py-10">
           <p className="text-[#919191] text-center text-[clamp(12px,2vmin,20px)] mb-3 sm:mb-4" style={{ fontFamily: "'Luckiest Guy', cursive" }}>EM PROGRESSO...</p>
@@ -1067,27 +1249,57 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
             </p>
           )}
 
-          {/* Follow-up input */}
-          <div className="relative mb-2.5">
-            <input
-              ref={followUpInputRef}
-              type="text"
-              value={followUpInput}
-              onChange={(e) => setFollowUpInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") sendFollowUp(); }}
-              placeholder="Continue a conversa..."
-              disabled={isFollowUpProcessing}
-              className="w-full px-3.5 py-2.5 sm:py-3 pr-11 rounded-[12px] border-2 border-[#2980b9]/25 bg-white font-['Inter',sans-serif] text-[clamp(13px,1.7vmin,16px)] text-[#1e1e1e] placeholder:text-[#b3b3b3] outline-none focus:border-[#2980b9] focus:ring-2 focus:ring-[#2980b9]/15 transition-all disabled:opacity-50"
-            />
-            {followUpInput.trim() && !isFollowUpProcessing && (
+          {/* Follow-up input with mic button */}
+          {isVoiceFollowUp ? (
+            <div className="mb-2.5 flex items-center gap-2">
+              <div className="flex-1 flex items-center gap-2 px-3 py-2.5 rounded-[12px] border-2 border-[#e74c3c]/40 bg-white">
+                <div className="w-2.5 h-2.5 rounded-full bg-[#e74c3c] animate-pulse" />
+                <span className="text-[#1e1e1e] text-[clamp(13px,1.7vmin,16px)] font-['Inter',sans-serif] flex-1 truncate">
+                  {followUpInput || "Ouvindo..."}
+                </span>
+                <span className="text-[#919191] text-[11px] font-['Inter',sans-serif]">
+                  {formatTime(voiceFollowUpTime)}
+                </span>
+              </div>
               <button
-                onClick={sendFollowUp}
-                className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full bg-[#27ae60] flex items-center justify-center hover:scale-110 active:scale-95 transition-transform"
+                onClick={stopVoiceFollowUp}
+                className="w-9 h-9 rounded-full bg-[#27ae60] flex items-center justify-center hover:scale-110 active:scale-95 transition-transform shadow"
               >
-                <Send className="w-3.5 h-3.5 text-white" />
+                <Send className="w-4 h-4 text-white" />
               </button>
-            )}
-          </div>
+            </div>
+          ) : (
+            <div className="relative mb-2.5 flex items-center gap-1.5">
+              <div className="relative flex-1">
+                <input
+                  ref={followUpInputRef}
+                  type="text"
+                  value={followUpInput}
+                  onChange={(e) => setFollowUpInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") sendFollowUp(); }}
+                  placeholder="Continue a conversa..."
+                  disabled={isFollowUpProcessing}
+                  className="w-full px-3.5 py-2.5 sm:py-3 pr-11 rounded-[12px] border-2 border-[#2980b9]/25 bg-white font-['Inter',sans-serif] text-[clamp(13px,1.7vmin,16px)] text-[#1e1e1e] placeholder:text-[#b3b3b3] outline-none focus:border-[#2980b9] focus:ring-2 focus:ring-[#2980b9]/15 transition-all disabled:opacity-50"
+                />
+                {followUpInput.trim() && !isFollowUpProcessing && (
+                  <button
+                    onClick={sendFollowUp}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full bg-[#27ae60] flex items-center justify-center hover:scale-110 active:scale-95 transition-transform"
+                  >
+                    <Send className="w-3.5 h-3.5 text-white" />
+                  </button>
+                )}
+              </div>
+              {/* Mic button for voice follow-up */}
+              <button
+                onClick={startVoiceFollowUp}
+                disabled={isFollowUpProcessing}
+                className="w-9 h-9 flex-shrink-0 rounded-full bg-[#af0100] flex items-center justify-center hover:scale-110 active:scale-95 transition-transform shadow disabled:opacity-50"
+              >
+                <Mic className="w-4 h-4 text-white" />
+              </button>
+            </div>
+          )}
 
           {/* Action buttons */}
           <div className="flex items-center justify-center gap-2 flex-shrink-0">
@@ -1124,13 +1336,12 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
           </div>
         </div>
 
-        {/* Bear */}
+        {/* 3D Character */}
         <div className="flex-1 flex items-center justify-center overflow-hidden relative min-h-0">
-          <div className="w-[70%] sm:w-[60%] lg:w-[75%] max-w-[400px] lg:max-w-[500px] aspect-square relative">
-            <img
-              alt="Tutor Bear"
-              className="w-full h-full object-contain pointer-events-none"
-              src={imgDesignSemNome1}
+          <div className="w-full h-full max-w-[600px] lg:max-w-[700px]">
+            <TutorCharacter3D
+              state={characterState}
+              micVolume={micVolume}
             />
           </div>
         </div>
