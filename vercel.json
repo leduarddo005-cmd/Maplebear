@@ -1,1 +1,6 @@
-{\n  "buildCommand": "npm run build",\n  "outputDirectory": "dist",\n  "framework": "vite",\n  "nodeVersion": "18.x"\n}
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "nodeVersion": "18.x"
+}
