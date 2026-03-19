@@ -1,10 +1,10 @@
+import { MainScreen } from "./components/MainScreen";
 import { useState, useCallback } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { SplashScreen } from "./components/SplashScreen";
 import { OnboardingScreen } from "./components/OnboardingScreen";
 import { LoginScreen } from "./components/LoginScreen";
 import { SelectTutorScreen } from "./components/SelectTutorScreen";
-import { MainScreen } from "./components/MainScreen";
 
 type Screen = "splash" | "onboarding" | "login" | "selectTutor" | "main";
 

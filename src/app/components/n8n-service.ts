@@ -11,7 +11,7 @@
 // ===== CONFIGURAÇÃO =====
 
 // URL padrão do webhook n8n — substitua pela sua URL de produção
-const DEFAULT_WEBHOOK_URL = "https://n8n.naveedu.io/webhook-test/maplebear-tutor";
+const DEFAULT_WEBHOOK_URL = "https://webhook.naveedu.io/webhook/maplebear-tutor";
 
 // Timeout para a chamada ao webhook (ms)
 const WEBHOOK_TIMEOUT = 30_000;
@@ -129,6 +129,8 @@ export async function sendToN8n(req: N8nRequest): Promise<N8nResponse> {
     appVersion: "1.0.0",
   });
 
+  console.log(`[n8n] Payload:`, JSON.parse(payload));
+
   // Tenta direto primeiro, depois via proxies CORS se falhar
   const urlsToTry = [
     webhookUrl,
@@ -142,7 +144,7 @@ export async function sendToN8n(req: N8nRequest): Promise<N8nResponse> {
     const label = isDirect ? "direct" : "proxy";
 
     try {
-      console.log(`[n8n] Trying ${label}: ${url.substring(0, 80)}...`);
+      console.log(`[n8n] Trying ${label}: ${url.substring(0, 100)}...`);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT);
 
@@ -194,6 +196,8 @@ export async function sendToN8n(req: N8nRequest): Promise<N8nResponse> {
         console.log(`[n8n] ✅ CORS proxy worked! Consider adding CORS headers to your n8n server.`);
       }
 
+      console.log(`[n8n] ✅ Response received (${text.length} chars)`);
+
       return {
         text: cleanResponse(text),
         audioUrl: data.audioUrl || data.audio_url || data.ttsUrl || undefined,
@@ -211,6 +215,7 @@ export async function sendToN8n(req: N8nRequest): Promise<N8nResponse> {
     }
   }
 
+  console.error("[n8n] All attempts failed:", lastError?.message);
   throw lastError || new Error("Webhook não respondeu");
 }
 

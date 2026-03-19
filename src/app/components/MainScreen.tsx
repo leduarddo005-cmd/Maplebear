@@ -662,6 +662,7 @@ export function MainScreen({ tutor, onMenuOpen }: MainScreenProps) {
           studentName: STUDENT_INFO.nome,
           studentInfo: STUDENT_INFO,
         });
+        console.log("[AI] n8n responded", { textLength: n8nResult.text.length, hasAudio: !!n8nResult.audioUrl });
         showResponse(n8nResult.text, n8nResult.audioUrl);
       } else {
         // 2️⃣ Gemini direto (webhook não configurado)
